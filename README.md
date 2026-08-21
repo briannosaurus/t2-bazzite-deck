@@ -51,6 +51,46 @@ future Bazzite kernel rebuild adding yet another such module doesn't
 silently reintroduce this break. This is the only functional change from
 Kansei's upstream script.
 
+### Known issue #2 fixed: emergency-shell boot failure from a stale initramfs
+
+The first attempt to actually boot the `t2-bazzite-deck:local` deployment
+dropped to the dracut emergency shell instead of completing. Diagnosed
+from `/boot/rdsosreport.txt`: `initrd-parse-etc.service` failed to exec
+`/usr/lib/systemd/systemd-sysroot-fstab-check` (`No such file or
+directory`) immediately after `ostree-prepare-root` resolved and mounted
+`/sysroot` -- that failure cascaded to `dracut-initqueue.service`
+stopping and dropping to `emergency.target` before switch-root ever
+happened.
+
+The deployed root filesystem itself was fine (the `systemd` package and
+all its files were verified present and intact via `podman run` +
+`rpm -V`) -- the problem was specifically that the **initramfs baked into
+the image** was missing that symlink, along with the `t2bce_dma`/
+`t2bce_core`/`t2bce_vhci` early-boot keyboard modules that
+`etc-overlay/dracut.conf.d/t2-bce.conf`'s `force_drivers` setting expects
+to force-load (`modprobe: FATAL: Module t2bce_dma not found`, also
+visible in the rdsosreport, though non-fatal to boot by itself).
+
+The cause: `build_files/t2-enablement-ublue.sh` already had a post-kernel
+`dracut` regen step (vendored from Kansei, needed so the T2 keyboard
+works for LUKS/early boot) -- but it was commented out, so the image
+shipped whatever stale/incomplete initramfs happened to get generated
+mid-transaction, before the T2 kernel modules and `force_drivers` config
+were all in place.
+
+Uncommenting that step alone wasn't sufficient: earlier in the same
+script, `rpm-ostree cliwrap install-to-root /` installs a wrapper at
+`/usr/bin/dracut` that drops privileges for invocations it doesn't
+recognize as "known safe" -- and the demoted process can't write to
+`/var/tmp` (a tmpfs mount for that build step), failing with `mktemp:
+... Permission denied`. The fix calls the real binary directly,
+`/usr/libexec/rpm-ostree/wrapped/dracut`, bypassing the wrapper.
+
+After rebuilding, `lsinitrd` on the new image's
+`/usr/lib/modules/7.1.8-200.t2.fc44.x86_64/initramfs.img` confirms both
+the `systemd-sysroot-fstab-check` symlink and all three `t2bce` modules
+are now present.
+
 ### Verified after the fix, against `ghcr.io/ublue-os/bazzite-deck:stable` (tag `44.20260820`)
 
 - Builds cleanly (`bootc container lint` passes with only benign warnings
@@ -76,11 +116,11 @@ Kansei's upstream script.
 - `apple-gmux.conf` (Radeon Pro dGPU muxing) and the T2 lid/suspend logind
   overrides from Kansei's `/etc` overlay are present in the final image.
 
-I could not test actually booting the image (that requires an
-`rpm-ostree rebase` + reboot on this specific hardware, which is
-intentionally left for you to trigger -- see "Test" below). Everything
-above was verified by building the image with `podman build` and
-inspecting its contents with `podman run`, not by booting it.
+A first boot attempt (`rpm-ostree rebase` + reboot) dropped to the dracut
+emergency shell -- see "Known issue #2 fixed" above for the diagnosis and
+fix. Aside from that boot attempt, everything above was verified by
+building the image with `podman build` and inspecting its contents with
+`podman run`, not by booting it.
 
 ### Known limitation carried over from Kansei (not new)
 
