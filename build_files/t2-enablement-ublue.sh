@@ -73,7 +73,16 @@ dnf5 install -y lm_sensors sg3_utils wodim xorriso radeontop libinput libinput-u
 # install IWD and radio software
 # iwd as backend seems to work better than wpa_supplicant on this hardware
 dnf5 swap -y wpa_supplicant iwd
-cat >> /etc/NetworkManager/conf.d/iwd.conf << EOF
+
+# t2-bazzite-deck addition: Bazzite's base image ships /usr/libexec/bazzite-iwd-migration,
+# a bazzite-iwd-migration.service (Before=NetworkManager.service, WantedBy=multi-user.target)
+# that unconditionally deletes /etc/NetworkManager/conf.d/iwd.conf on every boot as legacy
+# cruft from "earlier versions of bazzite-hardware-setup". Since we swap out wpa_supplicant
+# entirely above, if that file gets wiped NetworkManager falls back to its compiled-in
+# wpa_supplicant backend default and can never bring up wifi (D-Bus activation of a
+# nonexistent wpa_supplicant.service fails forever). Use a filename the migration script
+# doesn't match so it survives every boot.
+cat >> /etc/NetworkManager/conf.d/99-t2-wifi-backend.conf << EOF
 [device]
 wifi.backend=iwd
 EOF

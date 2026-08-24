@@ -13,129 +13,70 @@ Gaming Mode (`gamescope-session-ogui-steam`, `steamos-manager-powerstation`,
 `inputplumber`, Return-to-Gaming-Mode).
 
 The `Containerfile` here is Kansei's own
-`variants/t2-bazzite/Containerfile` with one line changed (the base image),
-plus one small addition to the vendored enablement script -- see
-"Known issue fixed" below. Everything else is Kansei's own build logic,
-vendored verbatim into `build_files/` and `etc-overlay/` under Apache-2.0
-(`LICENSE.kansei-os`), from
-[kansei-os/t2-atomic](https://github.com/kansei-os/t2-atomic) commit
-`ef80157` (2026-08-20).
+`variants/t2-bazzite/Containerfile` with one line changed (the base image).
+Everything else is Kansei's own build logic, vendored verbatim into
+`build_files/` and `etc-overlay/` under Apache-2.0 (`LICENSE.kansei-os`),
+from [kansei-os/t2-atomic](https://github.com/kansei-os/t2-atomic) commit
+`ef80157` (2026-08-20), with the fixes below layered on top.
 
-## What was tested (2026-08-21)
+## Status
 
-Before writing any of this, I reproduced the build locally with `podman
-build` against Kansei's *unmodified* `variants/t2-bazzite/Containerfile`
-(current `bazzite:stable`). It failed with a dependency-resolution error
-when overriding the kernel -- **this is a real, currently-open upstream
-break**, not something introduced by combining with Deck. It's also the
-same root cause behind
-[kansei-os/t2-atomic#71](https://github.com/kansei-os/t2-atomic/issues/71)
-("Multiple Workflows Keep Failing"), whose CI has failed daily since at
-least 2026-08-09 for every Fedora-44-based variant.
+Builds cleanly, passes `bootc container lint`, and **boots successfully**
+on a real `MacBookPro16,1` (confirmed 2026-08-24, running kernel
+`7.1.8-200.t2.fc44.x86_64`). Gaming Mode, T2 hardware enablement, and Wi-Fi
+have all been verified working on hardware.
 
-### Known issue fixed
+## Fixes on top of Kansei's upstream script
 
-Bazzite's current Fedora 44 kernel build (`7.2.0-ogc4.1.fc44`) ships several
-akmod-built kernel modules that pin to that exact kernel via the
-`kernel-uname-r` RPM capability: `kmod-evdi` (DisplayLink USB-GPU),
-`kmod-gcadapter_oc` (GameCube adapter overclock), `kmod-hid-fanatecff`
-(Fanatec racing wheel force-feedback), `kmod-kvmfr` (KVM/Looking-Glass frame
-relay), `kmod-nct6687d` (a specific desktop motherboard sensor chip). None
-of these apply to Apple hardware, but Kansei's static removal list predates
-them, so the T2 kernel override fails to depsolve.
+Kansei's own CI has been failing daily on Fedora-44-based variants since
+~2026-08-09 ([kansei-os/t2-atomic#71](https://github.com/kansei-os/t2-atomic/issues/71)).
+`build_files/t2-enablement-ublue.sh` carries three fixes beyond that
+upstream issue, each marked `t2-bazzite-deck addition` in the script:
 
-`build_files/t2-enablement-ublue.sh` adds one block (marked
-`t2-bazzite-deck addition`) that removes anything requiring
-`kernel-uname-r` dynamically, rather than hand-listing package names, so a
-future Bazzite kernel rebuild adding yet another such module doesn't
-silently reintroduce this break. This is the only functional change from
-Kansei's upstream script.
+1. **Kernel override depsolve failure.** Bazzite's Fedora 44 kernel build
+   ships akmod modules (`kmod-evdi`, `kmod-gcadapter_oc`,
+   `kmod-hid-fanatecff`, `kmod-kvmfr`, `kmod-nct6687d`) that pin to the
+   exact stock kernel via the `kernel-uname-r` RPM capability. None apply
+   to Apple hardware, but Kansei's static removal list predates them, so
+   the T2 kernel override failed to depsolve. Fixed by removing anything
+   requiring `kernel-uname-r` dynamically (via `rpm -q --whatrequires`)
+   instead of a hand-maintained name list, so future Bazzite kernel
+   rebuilds don't reintroduce the break.
 
-### Known issue #2 fixed: emergency-shell boot failure from a stale initramfs
+2. **Stale initramfs → dracut emergency shell on boot.** The post-kernel
+   `dracut` regen step (needed so the T2 keyboard works for early
+   boot/LUKS) was commented out, so the shipped initramfs was missing the
+   `systemd-sysroot-fstab-check` symlink and the `t2bce_dma`/`t2bce_core`/
+   `t2bce_vhci` keyboard modules. Fixed by uncommenting that step and
+   calling `/usr/libexec/rpm-ostree/wrapped/dracut` directly instead of the
+   `rpm-ostree cliwrap`-installed `/usr/bin/dracut`, which drops privileges
+   for unrecognized invocations and can't write to `/var/tmp` during the
+   build.
 
-The first attempt to actually boot the `t2-bazzite-deck:local` deployment
-dropped to the dracut emergency shell instead of completing. Diagnosed
-from `/boot/rdsosreport.txt`: `initrd-parse-etc.service` failed to exec
-`/usr/lib/systemd/systemd-sysroot-fstab-check` (`No such file or
-directory`) immediately after `ostree-prepare-root` resolved and mounted
-`/sysroot` -- that failure cascaded to `dracut-initqueue.service`
-stopping and dropping to `emergency.target` before switch-root ever
-happened.
+3. **Wi-Fi permanently "unavailable."** Bazzite's base image runs
+   `bazzite-iwd-migration.service` before `NetworkManager.service` on
+   *every* boot, which unconditionally deletes
+   `/etc/NetworkManager/conf.d/iwd.conf` as presumed legacy cruft. Kansei's
+   script writes its "use iwd" config to that exact filename and also swaps
+   out `wpa_supplicant` entirely, so once the file got deleted,
+   NetworkManager fell back to its compiled-in `wpa_supplicant` backend
+   default and could never bring up Wi-Fi (no such service left to
+   activate). Fixed by writing the config to
+   `/etc/NetworkManager/conf.d/99-t2-wifi-backend.conf` instead, a filename
+   the migration script doesn't target.
 
-The deployed root filesystem itself was fine (the `systemd` package and
-all its files were verified present and intact via `podman run` +
-`rpm -V`) -- the problem was specifically that the **initramfs baked into
-the image** was missing that symlink, along with the `t2bce_dma`/
-`t2bce_core`/`t2bce_vhci` early-boot keyboard modules that
-`etc-overlay/dracut.conf.d/t2-bce.conf`'s `force_drivers` setting expects
-to force-load (`modprobe: FATAL: Module t2bce_dma not found`, also
-visible in the rdsosreport, though non-fatal to boot by itself).
+## Known limitation (carried over from Kansei, not a regression)
 
-The cause: `build_files/t2-enablement-ublue.sh` already had a post-kernel
-`dracut` regen step (vendored from Kansei, needed so the T2 keyboard
-works for LUKS/early boot) -- but it was commented out, so the image
-shipped whatever stale/incomplete initramfs happened to get generated
-mid-transaction, before the T2 kernel modules and `force_drivers` config
-were all in place.
-
-Uncommenting that step alone wasn't sufficient: earlier in the same
-script, `rpm-ostree cliwrap install-to-root /` installs a wrapper at
-`/usr/bin/dracut` that drops privileges for invocations it doesn't
-recognize as "known safe" -- and the demoted process can't write to
-`/var/tmp` (a tmpfs mount for that build step), failing with `mktemp:
-... Permission denied`. The fix calls the real binary directly,
-`/usr/libexec/rpm-ostree/wrapped/dracut`, bypassing the wrapper.
-
-After rebuilding, `lsinitrd` on the new image's
-`/usr/lib/modules/7.1.8-200.t2.fc44.x86_64/initramfs.img` confirms both
-the `systemd-sysroot-fstab-check` symlink and all three `t2bce` modules
-are now present.
-
-### Verified after the fix, against `ghcr.io/ublue-os/bazzite-deck:stable` (tag `44.20260820`)
-
-- Builds cleanly (`bootc container lint` passes with only benign warnings
-  about non-empty `/boot`/`/run`/`/var` scratch files, which is normal for
-  an in-progress `rpm-ostree` layer).
-- T2 kernel (`kernel-core-7.1.8-200.t2.fc44`), `t2fanrd`, `t2linux-release`
-  all present and correctly enabled.
-- Gaming Mode packages all present and correct:
-  `gamescope-session-ogui-steam`, `gamescope-session`,
-  `gamescope-session-steam`, `terra-gamescope` (the actual package
-  providing `/usr/sbin/gamescope`), `steamos-manager-powerstation`
-  (provides `steamos-manager.service` + `steamosctl`), `inputplumber`.
-  `/usr/bin/return-to-gamemode` and `bazzite-autologin.service` are present
-  but not RPM-owned -- Bazzite bakes these in directly rather than
-  packaging them.
-- `/usr/share/wayland-sessions/` has both `plasma.desktop` and
-  `gamescope-session-ogui-steam.desktop` (plus `gamescope-session-steam.desktop`,
-  `gamescope-session-steam-plus.desktop`, `gamepadui-with-qam-session.desktop`).
-- `steamos-manager.service` and `inputplumber.service` are enabled.
-- `jupiter-fan-control.service` (Deck-hardware-only fan daemon) is present
-  but **disabled by default** -- no conflict with `t2fanrd`, which is
-  enabled.
-- `apple-gmux.conf` (Radeon Pro dGPU muxing) and the T2 lid/suspend logind
-  overrides from Kansei's `/etc` overlay are present in the final image.
-
-A first boot attempt (`rpm-ostree rebase` + reboot) dropped to the dracut
-emergency shell -- see "Known issue #2 fixed" above for the diagnosis and
-fix. Aside from that boot attempt, everything above was verified by
-building the image with `podman build` and inspecting its contents with
-`podman run`, not by booting it.
-
-### Known limitation carried over from Kansei (not new)
-
-**Sleep/wake will not work.** Kansei's enablement script masks
+**Sleep/wake does not work.** Kansei's enablement script masks
 `suspend.target` and disables lid-switch/suspend-key handling, with an
-explicit comment that suspend doesn't work on T2 Macs. This is already
-true of your currently-deployed `t2-atomic-bazzite`, not a regression
-introduced here.
+explicit comment that suspend doesn't work on T2 Macs.
 
-### Secure Boot
+## Secure Boot
 
 `mokutil --sb-state` reports Secure Boot disabled on this machine, so the
-unsigned custom kernel/image is not blocked by it. If you ever enable
-Secure Boot, this image (like your current T2 image, also unsigned --
-`ostree-unverified-registry`) will need to be re-evaluated.
+unsigned custom kernel/image isn't blocked by it. If you ever enable Secure
+Boot, this image (like the upstream `t2-atomic-bazzite` image, also
+unsigned -- `ostree-unverified-registry`) will need to be re-evaluated.
 
 ## Build
 
@@ -150,15 +91,15 @@ if needed.
 ## Test (no registry push required)
 
 `rpm-ostree` can rebase directly to an image sitting in local `podman`
-storage, so you can test this without publishing to GHCR at all:
+storage:
 
 ```bash
 sudo rpm-ostree rebase ostree-unverified-image:containers-storage:localhost/t2-bazzite-deck:local
 ```
 
-This stages a **new, third deployment**. Your currently-booted
-`t2-atomic-bazzite` deployment and your `bazzite-deck:stable` fallback
-deployment are both untouched and remain selectable at boot.
+This stages a **new, additional deployment**. Any previously-booted
+deployment (e.g. `t2-atomic-bazzite`, or a `bazzite-deck:stable` fallback)
+is untouched and remains selectable at boot.
 
 ```bash
 rpm-ostree status   # confirm the new deployment is staged, not yet booted
@@ -197,7 +138,10 @@ systemctl is-enabled steamos-manager.service inputplumber.service
 - Keyboard, trackpad: should work immediately (T2 `apple-bce`-derived
   stack via `t2linux-release`).
 - Wi-Fi, Bluetooth: `iwd`-backed NetworkManager + Broadcom firmware from
-  Kansei's `radio.tar`.
+  Kansei's `radio.tar`. If Wi-Fi shows as "unavailable" in `nmcli device
+  status`, check `/etc/NetworkManager/conf.d/99-t2-wifi-backend.conf`
+  exists and `systemctl status bazzite-iwd-migration.service` (see fix #3
+  above).
 - Speakers: T2 audio stack via `t2linux-release`.
 - Display brightness: standard backlight control, unaffected by this
   layering.
@@ -221,14 +165,11 @@ sudo rpm-ostree rollback
 systemctl reboot
 
 # Or from the bootloader menu at boot time:
-# select the previous deployment entry (your prior t2-atomic-bazzite
-# deployment, or the bazzite-deck:stable fallback) directly -- this does
-# not require the new deployment to boot successfully first.
+# select the previous deployment entry directly -- this does not require
+# the new deployment to boot successfully first.
 ```
 
-Neither your original `t2-atomic-bazzite` deployment nor your
-`bazzite-deck:stable` fallback deployment are modified by anything in this
-project.
+No prior deployment is modified by anything in this project.
 
 ## Publishing to GHCR (not done automatically)
 
@@ -252,7 +193,7 @@ sudo rpm-ostree rebase ostree-unverified-registry:ghcr.io/briannosaurus/t2-bazzi
 Containerfile              # base image swap + Kansei's enablement, mirrored 1:1
 build.sh                   # local podman build, no push
 build_files/
-  t2-enablement-ublue.sh   # vendored from kansei-os/t2-atomic + one addition (see above)
+  t2-enablement-ublue.sh   # vendored from kansei-os/t2-atomic + fixes (see above)
   ublue-packages.sh        # vendored verbatim (installs ublue-brew)
   common/radio.tar         # vendored verbatim (Broadcom Wi-Fi/BT firmware)
 etc-overlay/                # vendored verbatim from variants/common/etc/
